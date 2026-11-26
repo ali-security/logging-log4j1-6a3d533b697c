@@ -1,0 +1,95 @@
+# Build and test log4j 1.2.17 the way its own Maven build does: `mvn verify`
+# compiles for source/target 1.4, and the antrun `runAll` execution bound to the
+# test phase runs tests/build.xml's JUnit regression suite. Upstream ships no
+# GitHub Actions CI; this workflow was authored for the sealed build.
+name: seal-build
+
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "tests/build.xml target(s) to run instead of runAll (empty = full suite)"
+        required: false
+        default: ""
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      MAVEN_VERSION: 3.6.3
+      ZULU7: zulu7.56.0.11-ca-jdk7.0.352-linux_x64
+      MAVEN_OPTS: -Dhttps.protocols=TLSv1.2
+    steps:
+      - uses: actions/checkout@v4
+
+      # Zulu 7 is no longer listed by setup-java's zulu resolver, so fetch the
+      # last Zulu 7 build from Azul's CDN and install it via the jdkfile route.
+      - name: Cache Zulu JDK 7 download
+        id: jdk-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/jdk7.tar.gz
+          key: jdk-${{ runner.os }}-${{ runner.arch }}-${{ env.ZULU7 }}
+
+      - name: Download Zulu JDK 7
+        if: steps.jdk-cache.outputs.cache-hit != 'true'
+        run: curl -fsSL -o "${RUNNER_TEMP}/jdk7.tar.gz" "https://cdn.azul.com/zulu/bin/${ZULU7}.tar.gz"
+
+      - name: Set up JDK 7
+        uses: actions/setup-java@v4
+        with:
+          distribution: jdkfile
+          jdkFile: ${{ runner.temp }}/jdk7.tar.gz
+          java-version: "7.0.352"
+          architecture: x64
+          cache: maven
+
+      - name: Cache Maven ${{ env.MAVEN_VERSION }}
+        id: maven-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/apache-maven-${{ env.MAVEN_VERSION }}
+          key: maven-dist-${{ runner.os }}-${{ env.MAVEN_VERSION }}
+
+      - name: Install Maven ${{ env.MAVEN_VERSION }}
+        if: steps.maven-cache.outputs.cache-hit != 'true'
+        run: |
+          curl -fsSL "https://archive.apache.org/dist/maven/maven-3/${MAVEN_VERSION}/binaries/apache-maven-${MAVEN_VERSION}-bin.tar.gz" \
+            | tar -xz -C "${RUNNER_TEMP}"
+
+      - name: Put Maven on PATH
+        run: echo "${RUNNER_TEMP}/apache-maven-${MAVEN_VERSION}/bin" >> "$GITHUB_PATH"
+
+      - name: Build and test
+        run: |
+          set -o pipefail
+          java -version
+          mvn -version
+          TARGET="${{ inputs.test-filter }}"
+          if [ -z "$TARGET" ]; then TARGET=runAll; fi
+          mvn -B -e clean verify -Dmaven.site.skip=true "-Dlog4j.tests.target=${TARGET}" 2>&1 | tee build.log
+
+      - name: Test summary
+        run: |
+          awk '
+            /\[junit\] Testsuite: / { suite=$0; sub(/.*Testsuite: /, "", suite); next }
+            suite != "" && /\[junit\] Tests run: / {
+              line=$0; sub(/.*Tests run: /, "", line)
+              split(line, f, /, /)
+              r=f[1]; sub(/Failures: /, "", f[2]); sub(/Errors: /, "", f[3])
+              printf "SUITE %-55s run=%s failures=%s errors=%s\n", suite, r, f[2], f[3]
+              run+=r; fail+=f[2]; err+=f[3]; n++; suite=""
+            }
+            END {
+              printf "TOTAL: %d suites, tests run: %d, passed: %d, failures: %d, errors: %d, skipped: 0 (JUnit 3.8 has no skip mechanism)\n", n, run, run-fail-err, fail, err
+              if (n == 0) exit 1
+            }
+          ' build.log
+
+      - name: Upload jar
+        uses: actions/upload-artifact@v4
+        with:
+          name: log4j-jar
+          path: target/log4j-1.2.17.jar
+          if-no-files-found: error
